@@ -6,12 +6,6 @@ from datetime import timedelta
 import voluptuous as vol
 
 import homeassistant.helpers.config_validation as cv
-from homeassistant.components.notify import (
-    ATTR_MESSAGE,
-    ATTR_TITLE,
-    ATTR_DATA,
-    DOMAIN as DOMAIN_NOTIFY,
-)
 from homeassistant.const import (
     CONF_ENTITY_ID,
     STATE_IDLE,
@@ -26,24 +20,21 @@ from homeassistant.const import (
 )
 from homeassistant.helpers import service, event
 from homeassistant.helpers.entity import ToggleEntity
+from homeassistant.helpers.script import Script
 from homeassistant.util.dt import now
+from .const import (
+    DOMAIN,
+    ENTITY_ID_FORMAT,
+    CONF_CAN_ACK,
+    CONF_REPEAT,
+    CONF_SKIP_FIRST,
+    CONF_TRIGGERED,
+    CONF_DONE,
+    DEFAULT_CAN_ACK,
+    DEFAULT_SKIP_FIRST,
+)
 
 _LOGGER = logging.getLogger(__name__)
-
-DOMAIN = "alert"
-ENTITY_ID_FORMAT = DOMAIN + ".{}"
-
-CONF_CAN_ACK = "can_acknowledge"
-CONF_NOTIFIERS = "notifiers"
-CONF_REPEAT = "repeat"
-CONF_SKIP_FIRST = "skip_first"
-CONF_ALERT_MESSAGE = "message"
-CONF_DONE_MESSAGE = "done_message"
-CONF_TITLE = "title"
-CONF_DATA = "data"
-
-DEFAULT_CAN_ACK = True
-DEFAULT_SKIP_FIRST = False
 
 ALERT_SCHEMA = vol.Schema(
     {
@@ -53,17 +44,12 @@ ALERT_SCHEMA = vol.Schema(
         vol.Required(CONF_REPEAT): vol.All(cv.ensure_list, [vol.Coerce(float)]),
         vol.Required(CONF_CAN_ACK, default=DEFAULT_CAN_ACK): cv.boolean,
         vol.Required(CONF_SKIP_FIRST, default=DEFAULT_SKIP_FIRST): cv.boolean,
-        vol.Optional(CONF_ALERT_MESSAGE): cv.template,
-        vol.Optional(CONF_DONE_MESSAGE): cv.template,
-        vol.Optional(CONF_TITLE): cv.template,
-        vol.Optional(CONF_DATA): dict,
-        vol.Required(CONF_NOTIFIERS): cv.ensure_list,
+        vol.Optional(CONF_TRIGGERED): cv.SCRIPT_SCHEMA,
+        vol.Optional(CONF_DONE): cv.SCRIPT_SCHEMA,
     }
 )
 
-CONFIG_SCHEMA = vol.Schema(
-    {DOMAIN: cv.schema_with_slug_keys(ALERT_SCHEMA)}, extra=vol.ALLOW_EXTRA
-)
+CONFIG_SCHEMA = vol.Schema({DOMAIN: cv.schema_with_slug_keys(ALERT_SCHEMA)})
 
 ALERT_SERVICE_SCHEMA = vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_ids})
 
@@ -86,12 +72,9 @@ async def async_setup(hass, config):
         alert_state = cfg.get(CONF_STATE)
         repeat = cfg.get(CONF_REPEAT)
         skip_first = cfg.get(CONF_SKIP_FIRST)
-        message_template = cfg.get(CONF_ALERT_MESSAGE)
-        done_message_template = cfg.get(CONF_DONE_MESSAGE)
-        notifiers = cfg.get(CONF_NOTIFIERS)
         can_ack = cfg.get(CONF_CAN_ACK)
-        title_template = cfg.get(CONF_TITLE)
-        data = cfg.get(CONF_DATA)
+        triggered_action = cfg.get[CONF_TRIGGERED]
+        done_action = cfg.get[CONF_DONE]
 
         entities.append(
             Alert(
@@ -102,12 +85,9 @@ async def async_setup(hass, config):
                 alert_state,
                 repeat,
                 skip_first,
-                message_template,
-                done_message_template,
-                notifiers,
                 can_ack,
-                title_template,
-                data,
+                triggered_action,
+                done_action,
             )
         )
 
@@ -164,42 +144,27 @@ class Alert(ToggleEntity):
         state,
         repeat,
         skip_first,
-        message_template,
-        done_message_template,
-        notifiers,
         can_ack,
-        title_template,
-        data,
+        triggered_action,
+        done_action,
     ):
         """Initialize the alert."""
         self.hass = hass
         self._name = name
         self._alert_state = state
         self._skip_first = skip_first
-        self._data = data
-
-        self._message_template = message_template
-        if self._message_template is not None:
-            self._message_template.hass = hass
-
-        self._done_message_template = done_message_template
-        if self._done_message_template is not None:
-            self._done_message_template.hass = hass
-
-        self._title_template = title_template
-        if self._title_template is not None:
-            self._title_template.hass = hass
-
-        self._notifiers = notifiers
         self._can_ack = can_ack
+
+        self._triggered_script = Script(hass, triggered_action)
+        self._done_script = Script(hass, done_action)
 
         self._delay = [timedelta(minutes=val) for val in repeat]
         self._next_delay = 0
 
-        self._firing = False
+        self._triggered = False
         self._ack = False
         self._cancel = None
-        self._send_done_message = False
+        self._execute_done_script = False
         self.entity_id = ENTITY_ID_FORMAT.format(entity_id)
 
         event.async_track_state_change(
@@ -219,7 +184,7 @@ class Alert(ToggleEntity):
     @property
     def state(self):
         """Return the alert status."""
-        if self._firing:
+        if self._triggered:
             if self._ack:
                 return STATE_OFF
             return STATE_ON
@@ -228,27 +193,27 @@ class Alert(ToggleEntity):
     @property
     def hidden(self):
         """Hide the alert when it is not firing."""
-        return not self._can_ack or not self._firing
+        return not self._can_ack or not self._triggered
 
     async def watched_entity_change(self, entity, from_state, to_state):
         """Determine if the alert should start or stop."""
         _LOGGER.debug("Watched entity (%s) has changed", entity)
-        if to_state.state == self._alert_state and not self._firing:
+        if to_state.state == self._alert_state and not self._triggered:
             await self.begin_alerting()
-        if to_state.state != self._alert_state and self._firing:
+        if to_state.state != self._alert_state and self._triggered:
             await self.end_alerting()
 
     async def begin_alerting(self):
         """Begin the alert procedures."""
         _LOGGER.debug("Beginning Alert: %s", self._name)
         self._ack = False
-        self._firing = True
+        self._triggered = True
         self._next_delay = 0
 
         if not self._skip_first:
-            await self._notify()
+            await self._trigger()
         else:
-            await self._schedule_notify()
+            await self._schedule_trigger()
 
         self.async_schedule_update_ha_state()
 
@@ -257,66 +222,46 @@ class Alert(ToggleEntity):
         _LOGGER.debug("Ending Alert: %s", self._name)
         self._cancel()
         self._ack = False
-        self._firing = False
-        if self._send_done_message:
-            await self._notify_done_message()
+        self._triggered = False
+        if self._execute_done_script:
+            await self._done()
         self.async_schedule_update_ha_state()
 
-    async def _schedule_notify(self):
-        """Schedule a notification."""
+    async def _schedule_trigger(self):
+        """Schedule a trigger."""
         delay = self._delay[self._next_delay]
         next_msg = now() + delay
         self._cancel = event.async_track_point_in_time(
-            self.hass, self._notify, next_msg
+            self.hass, self._trigger, next_msg
         )
         self._next_delay = min(self._next_delay + 1, len(self._delay) - 1)
 
-    async def _notify(self, *args):
-        """Send the alert notification."""
-        if not self._firing:
+    async def _trigger(self, *args):
+        """Fire the triggered action."""
+        if not self._triggered:
             return
 
         if not self._ack:
-            _LOGGER.info("Alerting: %s", self._name)
-            self._send_done_message = True
+            _LOGGER.info("Triggered alert: %s", self._name)
+            self._execute_done_script = True
 
-            if self._message_template is not None:
-                message = self._message_template.async_render()
-            else:
-                message = self._name
+            self._execute_script(self._triggered_script)
+        await self._schedule_trigger()
 
-            await self._send_notification_message(message)
-        await self._schedule_notify()
+    async def _done(self, *args):
+        """Fire the done action."""
+        _LOGGER.info("Done alert: %s", self._name)
+        self._execute_done_script = False
+        self._execute_script(self._done_script)
 
-    async def _notify_done_message(self, *args):
-        """Send notification of complete alert."""
-        _LOGGER.info("Alerting: %s", self._done_message_template)
-        self._send_done_message = False
-
-        if self._done_message_template is None:
+    async def _execute_script(self, script):
+        if script is None:
             return
 
-        message = self._done_message_template.async_render()
-
-        await self._send_notification_message(message)
-
-    async def _send_notification_message(self, message):
-
-        msg_payload = {ATTR_MESSAGE: message}
-
-        if self._title_template is not None:
-            title = self._title_template.async_render()
-            msg_payload.update({ATTR_TITLE: title})
-        if self._data:
-            msg_payload.update({ATTR_DATA: self._data})
-
-        _LOGGER.debug(msg_payload)
-
-        for target in self._notifiers:
-            await self.hass.services.async_call(DOMAIN_NOTIFY, target, msg_payload)
+        await script.async_run(context=self._context)
 
     async def async_turn_on(self, **kwargs):
-        """Async Unacknowledge alert."""
+        """Async Reset alert."""
         _LOGGER.debug("Reset Alert: %s", self._name)
         self._ack = False
         await self.async_update_ha_state()
